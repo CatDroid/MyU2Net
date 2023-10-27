@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import onnx 
 
 class REBNCONV(nn.Module):
     def __init__(self,in_ch=3,out_ch=3,dirate=1):
@@ -20,7 +21,7 @@ class REBNCONV(nn.Module):
 ## upsample tensor 'src' to have the same spatial size with tensor 'tar'
 def _upsample_like(src,tar):
 
-    src = F.upsample(src,size=tar.shape[2:],mode='bilinear')
+    src = F.upsample(src,size=tar.shape[2:],mode='bilinear') # 宽高是tar大小
 
     return src
 
@@ -31,10 +32,11 @@ class RSU7(nn.Module):#UNet07DRES(nn.Module):
     def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU7,self).__init__()
 
-        self.rebnconvin = REBNCONV(in_ch,out_ch,dirate=1)
+        self.rebnconvin = REBNCONV(in_ch,out_ch,dirate=1) # 通过CBR 3x3卷积 通道in->out
 
-        self.rebnconv1 = REBNCONV(out_ch,mid_ch,dirate=1)
-        self.pool1 = nn.MaxPool2d(2,stride=2,ceil_mode=True)
+        # 残差U结构的U-block 输入输出都是out_ch 中间是mid_ch
+        self.rebnconv1 = REBNCONV(out_ch,mid_ch,dirate=1)   # 通过CBR 3x3卷积 通道out->mid
+        self.pool1 = nn.MaxPool2d(2,stride=2,ceil_mode=True)# 下采样 
 
         self.rebnconv2 = REBNCONV(mid_ch,mid_ch,dirate=1)
         self.pool2 = nn.MaxPool2d(2,stride=2,ceil_mode=True)
@@ -48,26 +50,27 @@ class RSU7(nn.Module):#UNet07DRES(nn.Module):
         self.rebnconv5 = REBNCONV(mid_ch,mid_ch,dirate=1)
         self.pool5 = nn.MaxPool2d(2,stride=2,ceil_mode=True)
 
-        self.rebnconv6 = REBNCONV(mid_ch,mid_ch,dirate=1)
+        self.rebnconv6 = REBNCONV(mid_ch,mid_ch,dirate=1) # 没有下采样 
 
-        self.rebnconv7 = REBNCONV(mid_ch,mid_ch,dirate=2)
+        self.rebnconv7 = REBNCONV(mid_ch,mid_ch,dirate=2) # 没有下采样 而是空洞卷积  最低层 
 
         self.rebnconv6d = REBNCONV(mid_ch*2,mid_ch,dirate=1)
         self.rebnconv5d = REBNCONV(mid_ch*2,mid_ch,dirate=1)
         self.rebnconv4d = REBNCONV(mid_ch*2,mid_ch,dirate=1)
         self.rebnconv3d = REBNCONV(mid_ch*2,mid_ch,dirate=1)
         self.rebnconv2d = REBNCONV(mid_ch*2,mid_ch,dirate=1)
-        self.rebnconv1d = REBNCONV(mid_ch*2,out_ch,dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch*2,out_ch,dirate=1) # U-block输出也是out_ch 
 
     def forward(self,x):
 
         hx = x
-        hxin = self.rebnconvin(hx)
+        hxin = self.rebnconvin(hx)  # CBR 3*3卷积 最后会跟U-Block相加 
 
+        # 下面是残差U结构 的 U-block  out-->M---out 
         hx1 = self.rebnconv1(hxin)
         hx = self.pool1(hx1)
 
-        hx2 = self.rebnconv2(hx)
+        hx2 = self.rebnconv2(hx) # 论文中 上面和这个作为一个: poo1+rebnconv2 是一个 下采样+CBR卷积 
         hx = self.pool2(hx2)
 
         hx3 = self.rebnconv3(hx)
@@ -79,12 +82,12 @@ class RSU7(nn.Module):#UNet07DRES(nn.Module):
         hx5 = self.rebnconv5(hx)
         hx = self.pool5(hx5)
 
-        hx6 = self.rebnconv6(hx)
+        hx6 = self.rebnconv6(hx) # 论文中这个之前没有下采样 但这里有 pool5
 
-        hx7 = self.rebnconv7(hx6)
+        hx7 = self.rebnconv7(hx6) # 空洞卷积
 
-        hx6d =  self.rebnconv6d(torch.cat((hx7,hx6),1))
-        hx6dup = _upsample_like(hx6d,hx5)
+        hx6d =  self.rebnconv6d(torch.cat((hx7,hx6),1)) # 输入通道数翻倍  但 卷积后 输出通道数是hout
+        hx6dup = _upsample_like(hx6d,hx5)  # 论文把这个 上采样upsample+concat和CBR卷积 作为一个 
 
         hx5d =  self.rebnconv5d(torch.cat((hx6dup,hx5),1))
         hx5dup = _upsample_like(hx5d,hx4)
@@ -98,9 +101,9 @@ class RSU7(nn.Module):#UNet07DRES(nn.Module):
         hx2d = self.rebnconv2d(torch.cat((hx3dup,hx2),1))
         hx2dup = _upsample_like(hx2d,hx1)
 
-        hx1d = self.rebnconv1d(torch.cat((hx2dup,hx1),1))
+        hx1d = self.rebnconv1d(torch.cat((hx2dup,hx1),1)) # 输出是out_ch 通道数目 
 
-        return hx1d + hxin
+        return hx1d + hxin  # 第一个RBC 3x3卷积 通道in->out结果 和 残差U结构 相加 
 
 ### RSU-6 ###
 class RSU6(nn.Module):#UNet06DRES(nn.Module):
@@ -349,17 +352,17 @@ class U2NET(nn.Module):
         self.side3 = nn.Conv2d(128,out_ch,3,padding=1)
         self.side4 = nn.Conv2d(256,out_ch,3,padding=1)
         self.side5 = nn.Conv2d(512,out_ch,3,padding=1)
-        self.side6 = nn.Conv2d(512,out_ch,3,padding=1)
+        self.side6 = nn.Conv2d(512,out_ch,3,padding=1) # side都是 用3*3卷积 输出 out_ch
 
-        self.outconv = nn.Conv2d(6*out_ch,out_ch,1)
+        self.outconv = nn.Conv2d(6*out_ch,out_ch,1) # 网络输出out_ch
 
     def forward(self,x):
 
         hx = x
 
         #stage 1
-        hx1 = self.stage1(hx)
-        hx = self.pool12(hx1)
+        hx1 = self.stage1(hx) # 通道数 in_ch -> 32(通过一个卷积) -> 64 
+        hx = self.pool12(hx1) # 通道数不变 减低一半分辨率 (外层U型结构的下采样)
 
         #stage 2
         hx2 = self.stage2(hx)
@@ -386,9 +389,9 @@ class U2NET(nn.Module):
         hx5dup = _upsample_like(hx5d,hx4)
 
         hx4d = self.stage4d(torch.cat((hx5dup,hx4),1))
-        hx4dup = _upsample_like(hx4d,hx3)
+        hx4dup = _upsample_like(hx4d,hx3) # hx3 是 stage3 输出 
 
-        hx3d = self.stage3d(torch.cat((hx4dup,hx3),1))
+        hx3d = self.stage3d(torch.cat((hx4dup,hx3),1)) # 通道数增加一倍 
         hx3dup = _upsample_like(hx3d,hx2)
 
         hx2d = self.stage2d(torch.cat((hx3dup,hx2),1))
@@ -398,10 +401,10 @@ class U2NET(nn.Module):
 
 
         #side output
-        d1 = self.side1(hx1d)
+        d1 = self.side1(hx1d) # 卷积 通道合并 64 -> out_ch 
 
-        d2 = self.side2(hx2d)
-        d2 = _upsample_like(d2,d1)
+        d2 = self.side2(hx2d) # 卷积 通道合并 64 -> out_ch 
+        d2 = _upsample_like(d2,d1)  # bilinear放到到d1大小 
 
         d3 = self.side3(hx3d)
         d3 = _upsample_like(d3,d1)
@@ -415,7 +418,7 @@ class U2NET(nn.Module):
         d6 = self.side6(hx6)
         d6 = _upsample_like(d6,d1)
 
-        d0 = self.outconv(torch.cat((d1,d2,d3,d4,d5,d6),1))
+        d0 = self.outconv(torch.cat((d1,d2,d3,d4,d5,d6),1)) # 在dim=1上concat每层  1x1卷积通道成 out_ch
 
         return F.sigmoid(d0), F.sigmoid(d1), F.sigmoid(d2), F.sigmoid(d3), F.sigmoid(d4), F.sigmoid(d5), F.sigmoid(d6)
 
@@ -425,7 +428,7 @@ class U2NETP(nn.Module):
     def __init__(self,in_ch=3,out_ch=1):
         super(U2NETP,self).__init__()
 
-        self.stage1 = RSU7(in_ch,16,64)
+        self.stage1 = RSU7(in_ch,16,64) # 小U2Net 中间所有残差U结构都是 输入64通道输出64通道 中间16通道 (大U2Net分辨率下降通道数会增加)
         self.pool12 = nn.MaxPool2d(2,stride=2,ceil_mode=True)
 
         self.stage2 = RSU6(64,16,64)
@@ -523,3 +526,26 @@ class U2NETP(nn.Module):
         d0 = self.outconv(torch.cat((d1,d2,d3,d4,d5,d6),1))
 
         return F.sigmoid(d0), F.sigmoid(d1), F.sigmoid(d2), F.sigmoid(d3), F.sigmoid(d4), F.sigmoid(d5), F.sigmoid(d6)
+
+
+if __name__ == '__main__':
+    model = U2NET()
+    img = torch.rand(
+        (1, 3, 288, 288)
+    )
+    torch.onnx.export(model, 
+                        img, 
+                        "u2net_netron_viz.onnx", 
+                        opset_version=11,
+                        export_params=True,
+                        do_constant_folding=False,
+                        training=torch.onnx.TrainingMode.TRAINING, 
+                        input_names=['input'],
+                        output_names=['output'],
+                        verbose=False
+                        );
+
+    model_file = 'u2net_netron_viz.onnx'
+    onnx_model = onnx.load(model_file)
+    onnx.save(onnx.shape_inference.infer_shapes(onnx_model), model_file)
+
